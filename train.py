@@ -6,80 +6,89 @@ import random
 import numpy as np
 import argparse
 from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from torch.nn import DataParallel
 from tokenizations.bpe_tokenizer import get_encoder
 
-
 def build_files(data_path, tokenized_data_path, num_pieces, full_tokenizer, min_length):
-    with open(data_path, 'r', encoding='utf8') as f:
-        print('reading lines')
+    with open(data_path, 'r', encoding='UTF-8') as f:
+        print('Reading Lines')
         lines = json.load(f)
-        lines = [line.replace('\n', ' [SEP] ') for line in lines]  # 用[SEP]表示换行, 段落之间使用SEP表示段落结束
+        # 用 [SEP] 取代換行，段落之間使用 [SEP] 表示段落結束
+        lines = [line.replace('\n', ' [SEP] ') for line in lines]
     all_len = len(lines)
-    if not os.path.exists(tokenized_data_path):
-        os.mkdir(tokenized_data_path)
+
+    os.makedirs(tokenized_data_path, exist_ok=True)
+
+    show = []
     for i in tqdm(range(num_pieces)):
         sublines = lines[all_len // num_pieces * i: all_len // num_pieces * (i + 1)]
         if i == num_pieces - 1:
-            sublines.extend(lines[all_len // num_pieces * (i + 1):])  # 把尾部例子添加到最后一个piece
-        sublines = [full_tokenizer.tokenize(line) for line in sublines if
-                    len(line) > min_length]  # 只考虑长度超过min_length的句子
+            # 將最後一個 Example 放到最後一個 Piece
+            sublines.extend(lines[all_len // num_pieces * (i + 1):])
+        # 只留下長度超過 min_length 的句子
+        sublines = [
+            full_tokenizer.tokenize(line) for line in sublines if len(line) > min_length]
+        show.append(random.choice(sublines))
         sublines = [full_tokenizer.convert_tokens_to_ids(line) for line in sublines]
         full_line = []
         for subline in sublines:
-            full_line.append(full_tokenizer.convert_tokens_to_ids('[MASK]'))  # 文章开头添加MASK表示文章开始
+            # 使用 [MASK] 表示文章開頭
+            full_line.append(full_tokenizer.convert_tokens_to_ids('[MASK]'))
             full_line.extend(subline)
-            full_line.append(full_tokenizer.convert_tokens_to_ids('[CLS]'))  # 文章之间添加CLS表示文章结束
+            # 使用 [CLS] 表示文章結束
+            full_line.append(full_tokenizer.convert_tokens_to_ids('[CLS]'))
+
         with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'w') as f:
             for id in full_line:
                 f.write(str(id) + ' ')
-    print('finish')
-
+    print('\n'.join([' '.join(s) for s in show[:10]]))
+    print('Done')
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--device', default='0,1,2,3', type=str, required=False, help='设置使用哪些显卡')
-    parser.add_argument('--model_config', default='config/model_config_small.json', type=str, required=False,
-                        help='选择模型参数')
-    parser.add_argument('--tokenizer_path', default='cache/vocab_small.txt', type=str, required=False, help='选择词库')
-    parser.add_argument('--raw_data_path', default='data/train.json', type=str, required=False, help='原始训练语料')
-    parser.add_argument('--tokenized_data_path', default='data/tokenized/', type=str, required=False,
-                        help='tokenized语料存放位置')
-    parser.add_argument('--raw', action='store_true', help='是否先做tokenize')
-    parser.add_argument('--epochs', default=5, type=int, required=False, help='训练循环')
-    parser.add_argument('--batch_size', default=8, type=int, required=False, help='训练batch size')
-    parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='学习率')
-    parser.add_argument('--warmup_steps', default=2000, type=int, required=False, help='warm up步数')
-    parser.add_argument('--log_step', default=1, type=int, required=False, help='多少步汇报一次loss，设置为gradient accumulation的整数倍')
-    parser.add_argument('--stride', default=768, type=int, required=False, help='训练时取训练数据的窗口步长')
-    parser.add_argument('--gradient_accumulation', default=1, type=int, required=False, help='梯度积累')
-    parser.add_argument('--fp16', action='store_true', help='混合精度')
+    parser.add_argument('--device', default='0,1,2,3', type=str, required=False, help='設定要使用的顯卡，以逗號區隔')
+    parser.add_argument(
+        '--model_config', type=str, required=True, help='模型參數設定檔的路徑')
+    parser.add_argument('--tokenizer_path', type=str, required=True, help='選擇字典檔的路徑')
+    parser.add_argument('--raw_data_path', type=str, required=True, help='訓練用語料庫的路徑')
+    parser.add_argument(
+        '--tokenized_data_path', default='data/tokenized/', type=str, required=False, help='語料庫 Tokenized 後的存放路徑')
+    parser.add_argument('--raw', action='store_true', help='是否已做過 Tokenization')
+    parser.add_argument('--epochs', default=5, type=int, required=False, help='設定訓練 Epochs 數量')
+    parser.add_argument('--batch_size', default=8, type=int, required=False, help='設定訓練 Batch Size 大小')
+    parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='設定訓練的 Learning Rate')
+    parser.add_argument('--warmup_steps', default=2000, type=int, required=False, help='設定 Optimizer 的 Warmup Steps')
+    parser.add_argument('--log_step', default=1, type=int, required=False, help='Loss 紀錄的間隔，必須是 Gradient Accumulation 的整數倍')
+    parser.add_argument('--stride', default=768, type=int, required=False, help='設定訓練語料庫的窗口大小')
+    parser.add_argument('--gradient_accumulation', default=1, type=int, required=False, help='梯度累積')
+    parser.add_argument('--fp16', action='store_true', help='是否使用半精度浮點數')
     parser.add_argument('--fp16_opt_level', default='O1', type=str, required=False)
     parser.add_argument('--max_grad_norm', default=1.0, type=float, required=False)
-    parser.add_argument('--num_pieces', default=100, type=int, required=False, help='将训练语料分成多少份')
-    parser.add_argument('--min_length', default=128, type=int, required=False, help='最短收录文章长度')
-    parser.add_argument('--output_dir', default='model/', type=str, required=False, help='模型输出路径')
-    parser.add_argument('--pretrained_model', default='', type=str, required=False, help='模型训练起点路径')
-    parser.add_argument('--writer_dir', default='tensorboard_summary/', type=str, required=False, help='Tensorboard路径')
-    parser.add_argument('--segment', action='store_true', help='中文以词为单位')
-    parser.add_argument('--bpe_token', action='store_true', help='subword')
+    parser.add_argument('--num_pieces', default=100, type=int, required=False, help='將訓練語料庫分成多少份')
+    parser.add_argument('--min_length', default=1, type=int, required=False, help='文章最短長度，若文章長度不足將被捨棄')
+    parser.add_argument('--output_dir', type=str, required=True, help='模型輸出路徑')
+    parser.add_argument('--pretrained_model', default='', type=str, required=False, help='模型起始路徑')
+    parser.add_argument('--writer_dir', default='tensorboard_summary/', type=str, required=False, help='Tensorboard 輸出路徑')
+    parser.add_argument('--segment', action='store_true', help='是否以詞為單位')
+    parser.add_argument('--bpe_token', action='store_true', help='使用 Byte Pair Encoding')
     parser.add_argument('--encoder_json', default="tokenizations/encoder.json", type=str, help="encoder.json")
     parser.add_argument('--vocab_bpe', default="tokenizations/vocab.bpe", type=str, help="vocab.bpe")
 
     args = parser.parse_args()
-    print('args:\n' + args.__repr__())
+    print(f'Arguments: {args.__repr__()}')
 
     if args.segment:
         from tokenizations import tokenization_bert_word_level as tokenization_bert
     else:
         from tokenizations import tokenization_bert
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device  # 此处设置程序使用哪些显卡
+    # 設定要使用的顯卡
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
 
     model_config = transformers.modeling_gpt2.GPT2Config.from_json_file(args.model_config)
-    print('config:\n' + model_config.to_json_string())
+    print('Config:\n' + model_config.to_json_string())
 
     n_ctx = model_config.n_ctx
     if args.bpe_token:
@@ -88,11 +97,11 @@ def main():
         full_tokenizer = tokenization_bert.BertTokenizer(vocab_file=args.tokenizer_path)
     full_tokenizer.max_len = 999999
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print('using device:', device)
+    print(f'Using Device: {device.upper()}')
 
     raw_data_path = args.raw_data_path
     tokenized_data_path = args.tokenized_data_path
-    raw = args.raw  # 选择是否从零开始构建数据集
+    raw = args.raw
     epochs = args.epochs
     batch_size = args.batch_size
     lr = args.lr
@@ -100,7 +109,8 @@ def main():
     log_step = args.log_step
     stride = args.stride
     gradient_accumulation = args.gradient_accumulation
-    fp16 = args.fp16  # 不支持半精度的显卡请勿打开
+    # 不支援半精度浮點數的顯卡不要打開
+    fp16 = args.fp16
     fp16_opt_level = args.fp16_opt_level
     max_grad_norm = args.max_grad_norm
     num_pieces = args.num_pieces
@@ -109,14 +119,17 @@ def main():
     tb_writer = SummaryWriter(log_dir=args.writer_dir)
     assert log_step % gradient_accumulation == 0
 
-    if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     if raw:
-        print('building files')
-        build_files(data_path=raw_data_path, tokenized_data_path=tokenized_data_path, num_pieces=num_pieces,
-                    full_tokenizer=full_tokenizer, min_length=min_length)
-        print('files built')
+        print('Building')
+        build_files(
+            data_path=raw_data_path,
+            tokenized_data_path=tokenized_data_path,
+            num_pieces=num_pieces,
+            full_tokenizer=full_tokenizer,
+            min_length=min_length
+        )
 
     if not args.pretrained_model:
         model = transformers.modeling_gpt2.GPT2LMHeadModel(config=model_config)
@@ -129,20 +142,21 @@ def main():
     parameters = model.parameters()
     for parameter in parameters:
         num_parameters += parameter.numel()
-    print('number of parameters: {}'.format(num_parameters))
+    print('Number of Parameters: {}'.format(num_parameters))
 
     multi_gpu = False
     full_len = 0
-    print('calculating total steps')
+    print('Calculating Total Steps')
     for i in tqdm(range(num_pieces)):
         with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'r') as f:
             full_len += len([int(item) for item in f.read().strip().split()])
     total_steps = int(full_len / stride * epochs / batch_size / gradient_accumulation)
-    print('total steps = {}'.format(total_steps))
+    print('Total Steps: {total_steps}')
 
     optimizer = transformers.AdamW(model.parameters(), lr=lr, correct_bias=True)
-    scheduler = transformers.WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps,
-                                                          t_total=total_steps)
+    scheduler = transformers.WarmupLinearSchedule(
+        optimizer, warmup_steps=warmup_steps, t_total=total_steps)
+
     if fp16:
         try:
             from apex import amp
@@ -151,16 +165,18 @@ def main():
         model, optimizer = amp.initialize(model, optimizer, opt_level=fp16_opt_level)
 
     if torch.cuda.device_count() > 1:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        print("Using", torch.cuda.device_count(), "GPUs")
         model = DataParallel(model, device_ids=[int(i) for i in args.device.split(',')])
         multi_gpu = True
-    print('starting training')
+
+    print('Training Begin')
     overall_step = 0
     running_loss = 0
+
     for epoch in range(epochs):
-        print('epoch {}'.format(epoch + 1))
-        now = datetime.now()
-        print('time: {}'.format(now))
+        print(f'Epoch {epoch + 1}')
+        now = datetime.utcnow() + timedelta(hours=8)
+        print(f'Time: {now}')
         x = np.linspace(0, num_pieces - 1, num_pieces, dtype=np.int32)
         random.shuffle(x)
         piece_num = 0
@@ -177,9 +193,9 @@ def main():
             if start_point < len(tokens):
                 samples.append(tokens[len(tokens)-n_ctx:])
             random.shuffle(samples)
-            for step in range(len(samples) // batch_size):  # drop last
-
-                #  prepare data
+            _steps = len(samples) // batch_size
+            for step in range(_steps):  # drop last
+                # prepare data
                 batch = samples[step * batch_size: (step + 1) * batch_size]
                 batch_inputs = []
                 for ids in batch:
@@ -187,17 +203,17 @@ def main():
                     batch_inputs.append(int_ids)
                 batch_inputs = torch.tensor(batch_inputs).long().to(device)
 
-                #  forward pass
+                # forward pass
                 outputs = model.forward(input_ids=batch_inputs, labels=batch_inputs)
                 loss, logits = outputs[:2]
 
-                #  get loss
+                # get loss
                 if multi_gpu:
                     loss = loss.mean()
                 if gradient_accumulation > 1:
                     loss = loss / gradient_accumulation
 
-                #  loss backward
+                # loss backward
                 if fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
@@ -206,7 +222,7 @@ def main():
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-                #  optimizer step
+                # optimizer step
                 if (overall_step + 1) % gradient_accumulation == 0:
                     running_loss += loss.item()
                     optimizer.step()
@@ -214,38 +230,39 @@ def main():
                     scheduler.step()
                 if (overall_step + 1) % log_step == 0:
                     tb_writer.add_scalar('loss', loss.item() * gradient_accumulation, overall_step)
-                    print('now time: {}:{}. Step {} of piece {} of epoch {}, loss {}'.format(
-                        datetime.now().hour,
-                        datetime.now().minute,
-                        step + 1,
-                        piece_num,
-                        epoch + 1,
-                        running_loss * gradient_accumulation / (log_step / gradient_accumulation)))
+                    ts = datetime.utcnow() + timedelta(hours=8)
+                    ts = ts.strftime('%H:%M:%S')
+                    display_loss = running_loss * gradient_accumulation / (log_step / gradient_accumulation)
+                    print(
+                        f'Time {ts} - '
+                        f'Epoch {epoch + 1:{slen(epochs)}d}/{epochs} - '
+                        f'Step {step + 1:{slen(_steps)}d}/{_steps} - '
+                        f'Piece {piece_num:{slen(num_pieces)}d}/{num_pieces} - '
+                        f'Loss {display_loss:.4f}'
+                    )
                     running_loss = 0
                 overall_step += 1
             piece_num += 1
 
-        print('saving model for epoch {}'.format(epoch + 1))
-        if not os.path.exists(output_dir + 'model_epoch{}'.format(epoch + 1)):
-            os.mkdir(output_dir + 'model_epoch{}'.format(epoch + 1))
+        print(f'Saving Model of Epoch {epoch + 1}')
+        model_output_dir = os.path.join(output_dir, f'model_epoch{epoch + 1}')
+        os.makedirs(model_output_dir, exist_ok=True)
         model_to_save = model.module if hasattr(model, 'module') else model
-        model_to_save.save_pretrained(output_dir + 'model_epoch{}'.format(epoch + 1))
-        # torch.save(scheduler.state_dict(), output_dir + 'model_epoch{}/scheduler.pt'.format(epoch + 1))
-        # torch.save(optimizer.state_dict(), output_dir + 'model_epoch{}/optimizer.pt'.format(epoch + 1))
-        print('epoch {} finished'.format(epoch + 1))
+        model_to_save.save_pretrained(model_output_dir)
+        print(f'Epoch {epoch + 1} Finished')
 
         then = datetime.now()
-        print('time: {}'.format(then))
-        print('time for one epoch: {}'.format(then - now))
+        print('Time: {}'.format(then))
+        print(f'Time Cost of the Epoch {epoch + 1}: {then - now}')
 
-    print('training finished')
-    if not os.path.exists(output_dir + 'final_model'):
-        os.mkdir(output_dir + 'final_model')
+    print('Training Done')
+    model_output_dir = os.path.join(output_dir, 'final_model')
+    os.makedirs(model_output_dir)
     model_to_save = model.module if hasattr(model, 'module') else model
-    model_to_save.save_pretrained(output_dir + 'final_model')
-    # torch.save(scheduler.state_dict(), output_dir + 'final_model/scheduler.pt')
-    # torch.save(optimizer.state_dict(), output_dir + 'final_model/optimizer.pt')
+    model_to_save.save_pretrained(model_output_dir)
 
+def slen(n):
+    return len(str(n))
 
 if __name__ == '__main__':
     main()
