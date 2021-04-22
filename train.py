@@ -43,8 +43,9 @@ def build_files(data_path, tokenized_data_path, num_pieces, full_tokenizer, min_
         with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'w') as f:
             for id in full_line:
                 f.write(str(id) + ' ')
-    print('\n'.join([' '.join(s) for s in show[:10]]))
-    print('Done')
+    print('Tokenized Data Sample')
+    print('\n'.join([' '.join(s) for s in show[:5]]))
+    print('Building from Raw Data Done')
 
 def main():
     parser = argparse.ArgumentParser()
@@ -56,9 +57,9 @@ def main():
     parser.add_argument(
         '--tokenized_data_path', default='data/tokenized/', type=str, required=False, help='語料庫 Tokenized 後的存放路徑')
     parser.add_argument('--raw', action='store_true', help='是否已做過 Tokenization')
-    parser.add_argument('--epochs', default=5, type=int, required=False, help='設定訓練 Epochs 數量')
-    parser.add_argument('--batch_size', default=8, type=int, required=False, help='設定訓練 Batch Size 大小')
-    parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='設定訓練的 Learning Rate')
+    parser.add_argument('--epochs', default=5, type=int, required=False, help='設定 Epochs')
+    parser.add_argument('--batch_size', default=8, type=int, required=False, help='設定 Batch Size')
+    parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='設定 Learning Rate')
     parser.add_argument('--warmup_steps', default=2000, type=int, required=False, help='設定 Optimizer 的 Warmup Steps')
     parser.add_argument('--log_step', default=1, type=int, required=False, help='Loss 紀錄的間隔，必須是 Gradient Accumulation 的整數倍')
     parser.add_argument('--stride', default=768, type=int, required=False, help='設定訓練語料庫的窗口大小')
@@ -73,8 +74,10 @@ def main():
     parser.add_argument('--writer_dir', default='tensorboard_summary/', type=str, required=False, help='Tensorboard 輸出路徑')
     parser.add_argument('--segment', action='store_true', help='是否以詞為單位')
     parser.add_argument('--bpe_token', action='store_true', help='使用 Byte Pair Encoding')
-    parser.add_argument('--encoder_json', default="tokenizations/encoder.json", type=str, help="encoder.json")
-    parser.add_argument('--vocab_bpe', default="tokenizations/vocab.bpe", type=str, help="vocab.bpe")
+    parser.add_argument('--encoder_json', default='tokenizations/encoder.json', type=str, help='encoder.json')
+    parser.add_argument('--vocab_bpe', default='tokenizations/vocab.bpe', type=str, help='vocab.bpe')
+    parser.add_argument('--timezone', default=8, type=int, help='手動指定時區，預設為 GMT+8')
+    parser.add_argument('--epoch_save', default=1, type=int, help='每隔幾個 Epoch 就存一次權重')
 
     args = parser.parse_args()
     print(f'Arguments: {args.__repr__()}')
@@ -116,13 +119,15 @@ def main():
     num_pieces = args.num_pieces
     min_length = args.min_length
     output_dir = args.output_dir
+    tz = args.timezone
+    get_time = lambda: datetime.utcnow() + timedelta(hours=tz)
     tb_writer = SummaryWriter(log_dir=args.writer_dir)
     assert log_step % gradient_accumulation == 0
 
     os.makedirs(output_dir, exist_ok=True)
 
     if raw:
-        print('Building')
+        print('Building from Raw Data')
         build_files(
             data_path=raw_data_path,
             tokenized_data_path=tokenized_data_path,
@@ -148,7 +153,7 @@ def main():
     full_len = 0
     print('Calculating Total Steps')
     for i in tqdm(range(num_pieces)):
-        with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'r') as f:
+        with open(tokenized_data_path + f'tokenized_train_{i}.txt', 'r') as f:
             full_len += len([int(item) for item in f.read().strip().split()])
     total_steps = int(full_len / stride * epochs / batch_size / gradient_accumulation)
     print('Total Steps: {total_steps}')
@@ -174,9 +179,8 @@ def main():
     running_loss = 0
 
     for epoch in range(epochs):
-        print(f'Epoch {epoch + 1}')
-        now = datetime.utcnow() + timedelta(hours=8)
-        print(f'Time: {now}')
+        now = get_time()
+        print(f'Epoch {epoch + 1} - Time: {now}')
         x = np.linspace(0, num_pieces - 1, num_pieces, dtype=np.int32)
         random.shuffle(x)
         piece_num = 0
@@ -193,8 +197,9 @@ def main():
             if start_point < len(tokens):
                 samples.append(tokens[len(tokens)-n_ctx:])
             random.shuffle(samples)
+            # 捨棄最後一個不足一個完整 Batch 的 Step
             _steps = len(samples) // batch_size
-            for step in range(_steps):  # drop last
+            for step in range(_steps):
                 # prepare data
                 batch = samples[step * batch_size: (step + 1) * batch_size]
                 batch_inputs = []
@@ -237,27 +242,30 @@ def main():
                         f'Time {ts} - '
                         f'Epoch {epoch + 1:{slen(epochs)}d}/{epochs} - '
                         f'Step {step + 1:{slen(_steps)}d}/{_steps} - '
-                        f'Piece {piece_num:{slen(num_pieces)}d}/{num_pieces} - '
+                        f'Piece {piece_num + 1:{slen(num_pieces)}d}/{num_pieces} - '
                         f'Loss {display_loss:.4f}'
                     )
                     running_loss = 0
                 overall_step += 1
             piece_num += 1
 
-        print(f'Saving Model of Epoch {epoch + 1}')
-        model_output_dir = os.path.join(output_dir, f'model_epoch{epoch + 1}')
-        os.makedirs(model_output_dir, exist_ok=True)
-        model_to_save = model.module if hasattr(model, 'module') else model
-        model_to_save.save_pretrained(model_output_dir)
-        print(f'Epoch {epoch + 1} Finished')
+        if (epoch + 1) % args.epoch_save == 0:
+            print(f'Saving Model of Epoch {epoch + 1}')
+            model_output_dir = os.path.join(output_dir, f'model_epoch{epoch + 1}')
+            os.makedirs(model_output_dir, exist_ok=True)
+            model_to_save = model.module if hasattr(model, 'module') else model
+            model_to_save.save_pretrained(model_output_dir)
 
-        then = datetime.now()
-        print('Time: {}'.format(then))
-        print(f'Time Cost of the Epoch {epoch + 1}: {then - now}')
+        then = get_time()
+        print(f'Epoch {epoch + 1} Finished - Time: {then}')
+        delta = (then - now).total_seconds()
+        mm, ss = delta // 60, delta % 60
+        hh, mm = mm // 60, mm % 60
+        print(f'Time Cost of the Epoch {epoch + 1} - {hh:.0f}:{mm:.0f}:{ss:.2f}')
 
     print('Training Done')
     model_output_dir = os.path.join(output_dir, 'final_model')
-    os.makedirs(model_output_dir)
+    os.makedirs(model_output_dir, exist_ok=True)
     model_to_save = model.module if hasattr(model, 'module') else model
     model_to_save.save_pretrained(model_output_dir)
 

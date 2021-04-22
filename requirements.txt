@@ -7,3 +7,4 @@ keras
 tb-nightly
 future
 thulac
+penut

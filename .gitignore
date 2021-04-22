@@ -5,3 +5,7 @@ tmp
 .gitignore
 lab/models
 lab/dataset
+lab/discord_dataset
+lab/pttbg
+*discord*
+*ptt*
