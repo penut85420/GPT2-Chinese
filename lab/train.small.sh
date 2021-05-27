@@ -1,6 +1,6 @@
-export CFG_PATH="./lab/model_config_small.json"
-export VOCAB_PATH="./lab/bert-base-chinese.vocab.txt"
-export DATA_PATH="./lab/dataset/corpus.small.json"
+export CFG_PATH="./lab/config.small.json"
+export VOCAB_PATH="../models/CKIP-GPT2/vocab.txt"
+export DATA_PATH="./lab/dataset/corpus.50k.json"
 export OUTPUT_PATH='./lab/models/small'
 
 python train.py \
@@ -8,11 +8,12 @@ python train.py \
   --tokenized_data_path ./tmp/small/tokenized/ \
   --tokenizer_path $VOCAB_PATH \
   --raw_data_path $DATA_PATH \
-  --epochs 200 \
+  --epochs 10 \
   --log_step 10 \
-  --stride 512 \
+  --stride 768 \
   --output_dir $OUTPUT_PATH \
-  --device 0 \
-  --num_pieces 100 \
-  --batch_size 16 \
+  --device 0,1 \
+  --num_pieces 128 \
+  --batch_size 128 \
+  --epoch_save 100 \
   --raw

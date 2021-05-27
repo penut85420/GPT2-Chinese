@@ -1,3 +1,7 @@
+#!/bin/bash
+
+# Example script of train from scratch
+
 export CFG_PATH="/path/to/config.json"
 export VOCAB_PATH="/path/to/vocab.txt"
 export DATA_PATH="/path/to/data.json"
@@ -8,10 +12,11 @@ python train.py \
   --tokenized_data_path ./tmp/tokenized/ \
   --tokenizer_path $VOCAB_PATH \
   --raw_data_path $DATA_PATH \
-  --epochs 30 \
+  --epochs 20 \
   --log_step 10 \
-  --stride 512 \
+  --stride 768 \
   --output_dir $OUTPUT_PATH \
-  --device 0 \
   --num_pieces 128 \
+  --batch_size 2 \
+  --epoch_save 5 \
   --raw

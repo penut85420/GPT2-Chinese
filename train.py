@@ -10,8 +10,9 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 from torch.nn import DataParallel
 from tokenizations.bpe_tokenizer import get_encoder
+from penut.utils import TimeCost
 
-def build_files(data_path, tokenized_data_path, num_pieces, full_tokenizer, min_length):
+def build_files(data_path, tokenized_data_path, num_pieces, tokenizer, min_length):
     with open(data_path, 'r', encoding='UTF-8') as f:
         print('Reading Lines')
         lines = json.load(f)
@@ -23,26 +24,32 @@ def build_files(data_path, tokenized_data_path, num_pieces, full_tokenizer, min_
 
     show = []
     for i in tqdm(range(num_pieces)):
-        sublines = lines[all_len // num_pieces * i: all_len // num_pieces * (i + 1)]
+        begin_idx = all_len // num_pieces * i
+        end_idx = all_len // num_pieces * (i + 1)
+        sublines = lines[begin_idx:end_idx]
+
         if i == num_pieces - 1:
             # 將最後一個 Example 放到最後一個 Piece
             sublines.extend(lines[all_len // num_pieces * (i + 1):])
+
         # 只留下長度超過 min_length 的句子
         sublines = [
-            full_tokenizer.tokenize(line) for line in sublines if len(line) > min_length]
+            tokenizer.tokenize(line) for line in sublines if len(line) > min_length]
         show.append(random.choice(sublines))
-        sublines = [full_tokenizer.convert_tokens_to_ids(line) for line in sublines]
+        sublines = [tokenizer.convert_tokens_to_ids(line) for line in sublines]
+
         full_line = []
         for subline in sublines:
             # 使用 [MASK] 表示文章開頭
-            full_line.append(full_tokenizer.convert_tokens_to_ids('[MASK]'))
+            full_line.append(tokenizer.convert_tokens_to_ids('[MASK]'))
             full_line.extend(subline)
             # 使用 [CLS] 表示文章結束
-            full_line.append(full_tokenizer.convert_tokens_to_ids('[CLS]'))
+            full_line.append(tokenizer.convert_tokens_to_ids('[CLS]'))
 
-        with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'w') as f:
-            for id in full_line:
-                f.write(str(id) + ' ')
+        fpath = os.path.join(tokenized_data_path, f'tokenized_train_{i}.txt')
+        with open(fpath, 'w') as f:
+            f.write(' '.join(map(str, full_line)))
+
     print('Tokenized Data Sample')
     print('\n'.join([' '.join(s) for s in show[:5]]))
     print('Building from Raw Data Done')
@@ -51,7 +58,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='0,1,2,3', type=str, required=False, help='設定要使用的顯卡，以逗號區隔')
     parser.add_argument(
-        '--model_config', type=str, required=True, help='模型參數設定檔的路徑')
+        '--model_config', type=str, required=False, help='模型參數設定檔的路徑')
     parser.add_argument('--tokenizer_path', type=str, required=True, help='選擇字典檔的路徑')
     parser.add_argument('--raw_data_path', type=str, required=True, help='訓練用語料庫的路徑')
     parser.add_argument(
@@ -60,7 +67,7 @@ def main():
     parser.add_argument('--epochs', default=5, type=int, required=False, help='設定 Epochs')
     parser.add_argument('--batch_size', default=8, type=int, required=False, help='設定 Batch Size')
     parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='設定 Learning Rate')
-    parser.add_argument('--warmup_steps', default=2000, type=int, required=False, help='設定 Optimizer 的 Warmup Steps')
+    parser.add_argument('--warmup_steps', default=0.1, type=float, required=False, help='設定 Warmup Steps 的比例')
     parser.add_argument('--log_step', default=1, type=int, required=False, help='Loss 紀錄的間隔，必須是 Gradient Accumulation 的整數倍')
     parser.add_argument('--stride', default=768, type=int, required=False, help='設定訓練語料庫的窗口大小')
     parser.add_argument('--gradient_accumulation', default=1, type=int, required=False, help='梯度累積')
@@ -132,7 +139,7 @@ def main():
             data_path=raw_data_path,
             tokenized_data_path=tokenized_data_path,
             num_pieces=num_pieces,
-            full_tokenizer=full_tokenizer,
+            tokenizer=full_tokenizer,
             min_length=min_length
         )
 
@@ -147,16 +154,17 @@ def main():
     parameters = model.parameters()
     for parameter in parameters:
         num_parameters += parameter.numel()
-    print('Number of Parameters: {}'.format(num_parameters))
+    print(f'Number of Parameters: {num_parameters}')
 
     multi_gpu = False
     full_len = 0
     print('Calculating Total Steps')
     for i in tqdm(range(num_pieces)):
-        with open(tokenized_data_path + f'tokenized_train_{i}.txt', 'r') as f:
+        with open(os.path.join(tokenized_data_path, f'tokenized_train_{i}.txt'), 'r') as f:
             full_len += len([int(item) for item in f.read().strip().split()])
     total_steps = int(full_len / stride * epochs / batch_size / gradient_accumulation)
-    print('Total Steps: {total_steps}')
+    warmup_steps = int(total_steps * warmup_steps)
+    print(f'Total Steps: {total_steps}')
 
     optimizer = transformers.AdamW(model.parameters(), lr=lr, correct_bias=True)
     scheduler = transformers.WarmupLinearSchedule(
@@ -172,98 +180,101 @@ def main():
     if torch.cuda.device_count() > 1:
         print("Using", torch.cuda.device_count(), "GPUs")
         model = DataParallel(model, device_ids=[int(i) for i in args.device.split(',')])
+        model.to(f'cuda:{model.device_ids[0]}')
         multi_gpu = True
 
-    print('Training Begin')
-    overall_step = 0
-    running_loss = 0
+    with TimeCost('Training'):
+        print('Training Begin')
+        overall_step = 0
+        running_loss = 0
 
-    for epoch in range(epochs):
-        now = get_time()
-        print(f'Epoch {epoch + 1} - Time: {now}')
-        x = np.linspace(0, num_pieces - 1, num_pieces, dtype=np.int32)
-        random.shuffle(x)
-        piece_num = 0
-        for i in x:
-            with open(tokenized_data_path + 'tokenized_train_{}.txt'.format(i), 'r') as f:
-                line = f.read().strip()
-            tokens = line.split()
-            tokens = [int(token) for token in tokens]
-            start_point = 0
-            samples = []
-            while start_point < len(tokens) - n_ctx:
-                samples.append(tokens[start_point: start_point + n_ctx])
-                start_point += stride
-            if start_point < len(tokens):
-                samples.append(tokens[len(tokens)-n_ctx:])
-            random.shuffle(samples)
-            # 捨棄最後一個不足一個完整 Batch 的 Step
-            _steps = len(samples) // batch_size
-            for step in range(_steps):
-                # prepare data
-                batch = samples[step * batch_size: (step + 1) * batch_size]
-                batch_inputs = []
-                for ids in batch:
-                    int_ids = [int(x) for x in ids]
-                    batch_inputs.append(int_ids)
-                batch_inputs = torch.tensor(batch_inputs).long().to(device)
+        for epoch in range(epochs):
+            now = get_time()
+            print(f'Epoch {epoch + 1} - Time: {now}')
+            x = np.linspace(0, num_pieces - 1, num_pieces, dtype=np.int32)
+            random.shuffle(x)
+            piece_num = 0
+            for i in x:
+                print(f'Tokenize {i}')
+                with open(tokenized_data_path + f'tokenized_train_{i}.txt', 'r') as f:
+                    line = f.read().strip()
+                tokens = line.split()
+                tokens = [int(token) for token in tokens]
+                start_point = 0
+                samples = []
+                while start_point < len(tokens) - n_ctx:
+                    samples.append(tokens[start_point: start_point + n_ctx])
+                    start_point += stride
+                if start_point < len(tokens):
+                    samples.append(tokens[len(tokens)-n_ctx:])
+                random.shuffle(samples)
+                # 捨棄最後一個不足一個完整 Batch 的 Step
+                _steps = len(samples) // batch_size
+                for step in range(_steps):
+                    # prepare data
+                    batch = samples[step * batch_size: (step + 1) * batch_size]
+                    batch_inputs = []
+                    for ids in batch:
+                        int_ids = [int(x) for x in ids]
+                        batch_inputs.append(int_ids)
+                    batch_inputs = torch.tensor(batch_inputs).long().to(device)
 
-                # forward pass
-                outputs = model.forward(input_ids=batch_inputs, labels=batch_inputs)
-                loss, logits = outputs[:2]
+                    # forward pass
+                    outputs = model.forward(input_ids=batch_inputs, labels=batch_inputs)
+                    loss, logits = outputs[:2]
 
-                # get loss
-                if multi_gpu:
-                    loss = loss.mean()
-                if gradient_accumulation > 1:
-                    loss = loss / gradient_accumulation
+                    # get loss
+                    if multi_gpu:
+                        loss = loss.mean()
+                    if gradient_accumulation > 1:
+                        loss = loss / gradient_accumulation
 
-                # loss backward
-                if fp16:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    # loss backward
+                    if fp16:
+                        with amp.scale_loss(loss, optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-                # optimizer step
-                if (overall_step + 1) % gradient_accumulation == 0:
-                    running_loss += loss.item()
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                if (overall_step + 1) % log_step == 0:
-                    tb_writer.add_scalar('loss', loss.item() * gradient_accumulation, overall_step)
-                    ts = datetime.utcnow() + timedelta(hours=8)
-                    ts = ts.strftime('%H:%M:%S')
-                    display_loss = running_loss * gradient_accumulation / (log_step / gradient_accumulation)
-                    print(
-                        f'Time {ts} - '
-                        f'Epoch {epoch + 1:{slen(epochs)}d}/{epochs} - '
-                        f'Step {step + 1:{slen(_steps)}d}/{_steps} - '
-                        f'Piece {piece_num + 1:{slen(num_pieces)}d}/{num_pieces} - '
-                        f'Loss {display_loss:.4f}'
-                    )
-                    running_loss = 0
-                overall_step += 1
-            piece_num += 1
+                    # optimizer step
+                    if (overall_step + 1) % gradient_accumulation == 0:
+                        running_loss += loss.item()
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        scheduler.step()
+                    if (overall_step + 1) % log_step == 0:
+                        tb_writer.add_scalar('loss', loss.item() * gradient_accumulation, overall_step)
+                        ts = datetime.utcnow() + timedelta(hours=8)
+                        ts = ts.strftime('%H:%M:%S')
+                        display_loss = running_loss * gradient_accumulation / (log_step / gradient_accumulation)
+                        print(
+                            f'Time {ts} - '
+                            f'Epoch {epoch + 1:{slen(epochs)}d}/{epochs} - '
+                            f'Step {step + 1:{slen(_steps)}d}/{_steps} - '
+                            f'Piece {piece_num + 1:{slen(num_pieces)}d}/{num_pieces} - '
+                            f'Loss {display_loss:.4f}'
+                        )
+                        running_loss = 0
+                    overall_step += 1
+                piece_num += 1
 
-        if (epoch + 1) % args.epoch_save == 0:
-            print(f'Saving Model of Epoch {epoch + 1}')
-            model_output_dir = os.path.join(output_dir, f'model_epoch{epoch + 1}')
-            os.makedirs(model_output_dir, exist_ok=True)
-            model_to_save = model.module if hasattr(model, 'module') else model
-            model_to_save.save_pretrained(model_output_dir)
+            if (epoch + 1) % args.epoch_save == 0:
+                print(f'Saving Model of Epoch {epoch + 1}')
+                model_output_dir = os.path.join(output_dir, f'model_epoch{epoch + 1}')
+                os.makedirs(model_output_dir, exist_ok=True)
+                model_to_save = model.module if hasattr(model, 'module') else model
+                model_to_save.save_pretrained(model_output_dir)
 
-        then = get_time()
-        print(f'Epoch {epoch + 1} Finished - Time: {then}')
-        delta = (then - now).total_seconds()
-        mm, ss = delta // 60, delta % 60
-        hh, mm = mm // 60, mm % 60
-        print(f'Time Cost of the Epoch {epoch + 1} - {hh:.0f}:{mm:.0f}:{ss:.2f}')
+            then = get_time()
+            print(f'Epoch {epoch + 1} Finished - Time: {then}')
+            delta = (then - now).total_seconds()
+            mm, ss = delta // 60, delta % 60
+            hh, mm = mm // 60, mm % 60
+            print(f'Time Cost of the Epoch {epoch + 1} - {hh:.0f}:{mm:.0f}:{ss:.2f}')
 
-    print('Training Done')
+        print('Training Done')
     model_output_dir = os.path.join(output_dir, 'final_model')
     os.makedirs(model_output_dir, exist_ok=True)
     model_to_save = model.module if hasattr(model, 'module') else model
@@ -273,4 +284,5 @@ def slen(n):
     return len(str(n))
 
 if __name__ == '__main__':
-    main()
+    with TimeCost('train.py'):
+        main()
