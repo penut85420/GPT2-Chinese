@@ -5,12 +5,12 @@ import json
 import random
 import numpy as np
 import argparse
-from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime, timedelta
 from tqdm import tqdm
-from torch.nn import DataParallel
-from tokenizations.bpe_tokenizer import get_encoder
 from penut.utils import TimeCost
+from torch.nn import DataParallel
+from datetime import datetime, timedelta
+from torch.utils.tensorboard import SummaryWriter
+from tokenizations.bpe_tokenizer import get_encoder
 
 def build_files(data_path, tokenized_data_path, num_pieces, tokenizer, min_length):
     with open(data_path, 'r', encoding='UTF-8') as f:
@@ -66,7 +66,7 @@ def main():
     parser.add_argument('--raw', action='store_true', help='是否已做過 Tokenization')
     parser.add_argument('--epochs', default=5, type=int, required=False, help='設定 Epochs')
     parser.add_argument('--batch_size', default=8, type=int, required=False, help='設定 Batch Size')
-    parser.add_argument('--lr', default=1.5e-4, type=float, required=False, help='設定 Learning Rate')
+    parser.add_argument('--lr', default=3e-5, type=float, required=False, help='設定 Learning Rate')
     parser.add_argument('--warmup_steps', default=0.1, type=float, required=False, help='設定 Warmup Steps 的比例')
     parser.add_argument('--log_step', default=1, type=int, required=False, help='Loss 紀錄的間隔，必須是 Gradient Accumulation 的整數倍')
     parser.add_argument('--stride', default=768, type=int, required=False, help='設定訓練語料庫的窗口大小')
@@ -95,16 +95,21 @@ def main():
         from tokenizations import tokenization_bert
 
     # 設定要使用的顯卡
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.device
 
-    model_config = transformers.modeling_gpt2.GPT2Config.from_json_file(args.model_config)
-    print('Config:\n' + model_config.to_json_string())
+    model_config = transformers.GPT2Config.from_json_file(
+        args.model_config)
+    print(f'Config:\n{model_config.to_json_string()}')
 
     n_ctx = model_config.n_ctx
     if args.bpe_token:
         full_tokenizer = get_encoder(args.encoder_json, args.vocab_bpe)
     else:
-        full_tokenizer = tokenization_bert.BertTokenizer(vocab_file=args.tokenizer_path)
+        full_tokenizer = tokenization_bert.BertTokenizer(
+            vocab_file=args.tokenizer_path,
+            do_lower_case=False,
+            do_basic_tokenize=False
+        )
     full_tokenizer.max_len = 999999
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using Device: {device.upper()}')
@@ -119,7 +124,7 @@ def main():
     log_step = args.log_step
     stride = args.stride
     gradient_accumulation = args.gradient_accumulation
-    # 不支援半精度浮點數的顯卡不要打開
+    # 不支援半精度浮點數的顯卡不要使用
     fp16 = args.fp16
     fp16_opt_level = args.fp16_opt_level
     max_grad_norm = args.max_grad_norm
@@ -127,6 +132,7 @@ def main():
     min_length = args.min_length
     output_dir = args.output_dir
     tz = args.timezone
+    strlen = lambda n: len(str(n))
     get_time = lambda: datetime.utcnow() + timedelta(hours=tz)
     tb_writer = SummaryWriter(log_dir=args.writer_dir)
     assert log_step % gradient_accumulation == 0
@@ -144,11 +150,23 @@ def main():
         )
 
     if not args.pretrained_model:
-        model = transformers.modeling_gpt2.GPT2LMHeadModel(config=model_config)
+        model = transformers.GPT2LMHeadModel(config=model_config)
     else:
-        model = transformers.modeling_gpt2.GPT2LMHeadModel.from_pretrained(args.pretrained_model)
+        model = transformers.GPT2LMHeadModel.from_pretrained(
+            args.pretrained_model)
+
+    if torch.cuda.device_count() == 2:
+        device_map = {
+            0: [0, 1, 2, 3, 4],
+            1: [5, 6, 7, 8, 9, 10, 11],
+        }
+        model.parallelize(device_map)
+        # model.parallelize()
+        print('Model Parallelism!')
+
     model.train()
-    model.to(device)
+    if torch.cuda.device_count() < 2:
+        model.to(device)
 
     num_parameters = 0
     parameters = model.parameters()
@@ -160,28 +178,30 @@ def main():
     full_len = 0
     print('Calculating Total Steps')
     for i in tqdm(range(num_pieces)):
-        with open(os.path.join(tokenized_data_path, f'tokenized_train_{i}.txt'), 'r') as f:
+        _fpath = os.path.join(tokenized_data_path, f'tokenized_train_{i}.txt')
+        with open(_fpath, 'r') as f:
             full_len += len([int(item) for item in f.read().strip().split()])
     total_steps = int(full_len / stride * epochs / batch_size / gradient_accumulation)
     warmup_steps = int(total_steps * warmup_steps)
     print(f'Total Steps: {total_steps}')
 
     optimizer = transformers.AdamW(model.parameters(), lr=lr, correct_bias=True)
-    scheduler = transformers.WarmupLinearSchedule(
-        optimizer, warmup_steps=warmup_steps, t_total=total_steps)
+    scheduler = transformers.get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
     if fp16:
         try:
             from apex import amp
         except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+            raise ImportError('Please install apex from https://www.github.com/nvidia/apex to use fp16 training.')
         model, optimizer = amp.initialize(model, optimizer, opt_level=fp16_opt_level)
 
-    if torch.cuda.device_count() > 1:
-        print("Using", torch.cuda.device_count(), "GPUs")
-        model = DataParallel(model, device_ids=[int(i) for i in args.device.split(',')])
-        model.to(f'cuda:{model.device_ids[0]}')
-        multi_gpu = True
+    # if torch.cuda.device_count() > 1:
+    #     print(f'Using {torch.cuda.device_count()} GPUs')
+    #     model = DataParallel(
+    #         model, device_ids=[int(i) for i in args.device.split(',')])
+    #     model.to(f'cuda:{model.device_ids[0]}')
+    #     multi_gpu = True
 
     with TimeCost('Training'):
         print('Training Begin')
@@ -195,8 +215,9 @@ def main():
             random.shuffle(x)
             piece_num = 0
             for i in x:
-                print(f'Tokenize {i}')
-                with open(tokenized_data_path + f'tokenized_train_{i}.txt', 'r') as f:
+                _fpath = os.path.join(
+                    tokenized_data_path, f'tokenized_train_{i}.txt')
+                with open(_fpath, 'r') as f:
                     line = f.read().strip()
                 tokens = line.split()
                 tokens = [int(token) for token in tokens]
@@ -206,10 +227,16 @@ def main():
                     samples.append(tokens[start_point: start_point + n_ctx])
                     start_point += stride
                 if start_point < len(tokens):
-                    samples.append(tokens[len(tokens)-n_ctx:])
+                    idx = len(tokens) - n_ctx
+                    samples.append(tokens[idx:])
+                print(f'Tokenize {i} Sample Size: {len(samples)}')
                 random.shuffle(samples)
                 # 捨棄最後一個不足一個完整 Batch 的 Step
                 _steps = len(samples) // batch_size
+                # 若 Samples 數量小於 Batch Size 會發生完全沒有 Steps 可以訓練的問題
+                # 不要把 num_pieces 設定的太大，也可以解決這個問題
+                _steps = 1 if _steps <= 0 else _steps
+
                 for step in range(_steps):
                     # prepare data
                     batch = samples[step * batch_size: (step + 1) * batch_size]
@@ -217,11 +244,13 @@ def main():
                     for ids in batch:
                         int_ids = [int(x) for x in ids]
                         batch_inputs.append(int_ids)
-                    batch_inputs = torch.tensor(batch_inputs).long().to(device)
+                    _device = 'cuda:0' if torch.cuda.device_count() > 1 else device
+                    batch_inputs = torch.tensor(batch_inputs).long().to(_device)
 
                     # forward pass
-                    outputs = model.forward(input_ids=batch_inputs, labels=batch_inputs)
-                    loss, logits = outputs[:2]
+                    outputs = model.forward(
+                        input_ids=batch_inputs, labels=batch_inputs)
+                    loss, _ = outputs[:2]
 
                     # get loss
                     if multi_gpu:
@@ -233,10 +262,12 @@ def main():
                     if fp16:
                         with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(
+                                amp.master_params(optimizer), max_grad_norm)
                     else:
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_grad_norm)
 
                     # optimizer step
                     if (overall_step + 1) % gradient_accumulation == 0:
@@ -245,15 +276,17 @@ def main():
                         optimizer.zero_grad()
                         scheduler.step()
                     if (overall_step + 1) % log_step == 0:
-                        tb_writer.add_scalar('loss', loss.item() * gradient_accumulation, overall_step)
+                        tb_writer.add_scalar(
+                            'loss', loss.item() * gradient_accumulation, overall_step)
                         ts = datetime.utcnow() + timedelta(hours=8)
                         ts = ts.strftime('%H:%M:%S')
-                        display_loss = running_loss * gradient_accumulation / (log_step / gradient_accumulation)
+                        display_loss = running_loss * gradient_accumulation
+                        display_loss /= log_step / gradient_accumulation
                         print(
                             f'Time {ts} - '
-                            f'Epoch {epoch + 1:{slen(epochs)}d}/{epochs} - '
-                            f'Step {step + 1:{slen(_steps)}d}/{_steps} - '
-                            f'Piece {piece_num + 1:{slen(num_pieces)}d}/{num_pieces} - '
+                            f'Epoch {epoch + 1:{strlen(epochs)}d}/{epochs} - '
+                            f'Step {step + 1:{strlen(_steps)}d}/{_steps} - '
+                            f'Piece {piece_num + 1:{strlen(num_pieces)}d}/{num_pieces} - '
                             f'Loss {display_loss:.4f}'
                         )
                         running_loss = 0
@@ -279,9 +312,6 @@ def main():
     os.makedirs(model_output_dir, exist_ok=True)
     model_to_save = model.module if hasattr(model, 'module') else model
     model_to_save.save_pretrained(model_output_dir)
-
-def slen(n):
-    return len(str(n))
 
 if __name__ == '__main__':
     with TimeCost('train.py'):

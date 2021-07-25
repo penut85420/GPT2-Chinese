@@ -8,12 +8,12 @@ python train.py \
   --tokenized_data_path ./tmp/small/tokenized/ \
   --tokenizer_path $VOCAB_PATH \
   --raw_data_path $DATA_PATH \
-  --epochs 10 \
+  --epochs 1 \
   --log_step 10 \
   --stride 768 \
   --output_dir $OUTPUT_PATH \
   --device 0,1 \
-  --num_pieces 128 \
-  --batch_size 128 \
+  --num_pieces 10 \
+  --batch_size 16 \
   --epoch_save 100 \
   --raw
